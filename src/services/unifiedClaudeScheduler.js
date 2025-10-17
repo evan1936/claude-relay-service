@@ -481,6 +481,10 @@ class UnifiedClaudeScheduler {
     // 获取官方Claude账户（共享池）
     const claudeAccounts = await redis.getAllClaudeAccounts()
     for (const account of claudeAccounts) {
+      // 构建 Claude Usage 快照
+      if (!account.claudeUsage) {
+        account.claudeUsage = claudeAccountService.buildClaudeUsageSnapshot(account)
+      }
       if (
         account.isActive === 'true' &&
         account.status !== 'error' &&
@@ -512,12 +516,49 @@ class UnifiedClaudeScheduler {
           }
         }
 
+        // 🔄 如果5小时窗口数据缺失，主动获取
+        let accountWithUsage = account
+        if (!account.claudeUsage || !account.claudeUsage.fiveHour || account.claudeUsage.fiveHour.remainingSeconds === null) {
+          // 检查是否是 OAuth 账户
+          const scopes = account.scopes && account.scopes.trim() ? account.scopes.split(' ') : []
+          const isOAuth = scopes.includes('user:profile') && scopes.includes('user:inference')
+
+          if (isOAuth) {
+            logger.info(
+              `📊 5-hour usage data missing for account ${account.name}, fetching from API...`
+            )
+            try {
+              const usageData = await claudeAccountService.fetchOAuthUsage(account.id)
+              if (usageData && usageData.five_hour) {
+                await claudeAccountService.updateClaudeUsageSnapshot(account.id, usageData)
+                // 重新获取账户数据
+                const updatedAccount = await claudeAccountService.getAccount(account.id)
+                if (updatedAccount) {
+                  // 重新构建 claudeUsage
+                  const claudeUsage = claudeAccountService.buildClaudeUsageSnapshot(updatedAccount)
+                  accountWithUsage = { ...updatedAccount, claudeUsage }
+                  logger.info(
+                    `✅ Successfully fetched 5-hour usage for account ${account.name}`
+                  )
+                }
+              }
+            } catch (error) {
+              logger.warn(
+                `⚠️ Failed to fetch 5-hour usage for account ${account.name}:`,
+                error.message
+              )
+              // 继续使用原账户数据
+
+            }
+          }
+        }
+
         availableAccounts.push({
-          ...account,
-          accountId: account.id,
+          ...accountWithUsage,
+          accountId: accountWithUsage.id,
           accountType: 'claude-official',
-          priority: parseInt(account.priority) || 50, // 默认优先级50
-          lastUsedAt: account.lastUsedAt || '0'
+          priority: parseInt(accountWithUsage.priority) || 50, // 默认优先级50
+          lastUsedAt: accountWithUsage.lastUsedAt || '0'
         })
       }
     }
@@ -721,11 +762,93 @@ class UnifiedClaudeScheduler {
         return a.priority - b.priority
       }
 
-      // 优先级相同时，按最后使用时间排序（最久未使用的优先）
+      // 优先级相同时，按额度到期策略排序
+      const expiryComparison = this._compareByExpiryUrgency(a, b)
+      if (expiryComparison !== 0) {
+        return expiryComparison
+      }
+
+      // 最后按最后使用时间排序（最久未使用的优先）
       const aLastUsed = new Date(a.lastUsedAt || 0).getTime()
       const bLastUsed = new Date(b.lastUsedAt || 0).getTime()
       return aLastUsed - bLastUsed
     })
+  }
+
+  // 🎯 比较两个账户的额度到期紧急度
+  // 策略：优先消耗7天快到期的账号，然后是5小时快到期的账号
+  // 返回值：负数表示a优先，正数表示b优先，0表示相同
+  _compareByExpiryUrgency(accountA, accountB) {
+    // 如果都没有claudeUsage数据，视为相同
+    if (!accountA.claudeUsage && !accountB.claudeUsage) {
+      return 0
+    }
+
+    // 只有一个有数据，有数据的优先（因为可以利用快到期的额度）
+    if (!accountA.claudeUsage) return 1
+    if (!accountB.claudeUsage) return -1
+
+    // === 第一优先级：7天窗口剩余时间（越少越优先） ===
+    const aSevenDayRemaining = this._getSevenDayRemaining(accountA)
+    const bSevenDayRemaining = this._getSevenDayRemaining(accountB)
+
+    // 如果都有7天窗口数据，比较剩余时间
+    if (aSevenDayRemaining !== null && bSevenDayRemaining !== null) {
+      // 剩余时间越少越优先（升序排列）
+      if (aSevenDayRemaining !== bSevenDayRemaining) {
+        return aSevenDayRemaining - bSevenDayRemaining
+      }
+    }
+
+    // === 第二优先级：5小时窗口剩余时间（越少越优先） ===
+    const aFiveHourRemaining = this._getFiveHourRemaining(accountA)
+    const bFiveHourRemaining = this._getFiveHourRemaining(accountB)
+
+    // 如果都有5小时窗口数据，比较剩余时间
+    if (aFiveHourRemaining !== null && bFiveHourRemaining !== null) {
+      // 剩余时间越少越优先（升序排列）
+      if (aFiveHourRemaining !== bFiveHourRemaining) {
+        return aFiveHourRemaining - bFiveHourRemaining
+      }
+    }
+
+    // 如果7天和5小时都相同（或都没有数据），返回0
+    return 0
+  }
+
+  // 📊 获取账户的7天窗口剩余秒数（包含7天普通和7天Opus，取最小值）
+  _getSevenDayRemaining(account) {
+    if (!account.claudeUsage) return null
+
+    const { sevenDay, sevenDayOpus } = account.claudeUsage
+    let minRemaining = null
+
+    // 7天普通窗口
+    if (sevenDay && sevenDay.remainingSeconds !== null) {
+      minRemaining = sevenDay.remainingSeconds
+    }
+
+    // 7天Opus窗口（取更小的值）
+    if (sevenDayOpus && sevenDayOpus.remainingSeconds !== null) {
+      if (minRemaining === null || sevenDayOpus.remainingSeconds < minRemaining) {
+        minRemaining = sevenDayOpus.remainingSeconds
+      }
+    }
+
+    return minRemaining
+  }
+
+  // 📊 获取账户的5小时窗口剩余秒数
+  _getFiveHourRemaining(account) {
+    if (!account.claudeUsage) return null
+
+    const { fiveHour } = account.claudeUsage
+
+    if (fiveHour && fiveHour.remainingSeconds !== null) {
+      return fiveHour.remainingSeconds
+    }
+
+    return null
   }
 
   // 🔍 检查账户是否可用

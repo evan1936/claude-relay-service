@@ -472,7 +472,36 @@ class ClaudeAccountService {
           const sessionWindowInfo = await this.getSessionWindowInfo(account.id)
 
           // 构建 Claude Usage 快照（从 Redis 读取）
-          const claudeUsage = this.buildClaudeUsageSnapshot(account)
+          let claudeUsage = this.buildClaudeUsageSnapshot(account)
+
+          // 🔄 如果没有 Claude Usage 数据且是 OAuth 账户，尝试主动获取
+          if (!claudeUsage) {
+            const scopes = account.scopes && account.scopes.trim() ? account.scopes.split(' ') : []
+            const isOAuth = scopes.includes('user:profile') && scopes.includes('user:inference')
+            if (isOAuth) {
+              logger.info(
+                `📊 No Claude Usage data found for account ${account.name}, fetching from API...`
+              )
+              try {
+                const usageData = await this.fetchOAuthUsage(account.id)
+                if (usageData) {
+                  await this.updateClaudeUsageSnapshot(account.id, usageData)
+                  // 重新构建快照
+                  const updatedAccount = await redis.getClaudeAccount(account.id)
+                  claudeUsage = this.buildClaudeUsageSnapshot(updatedAccount)
+                  logger.info(
+                    `✅ Successfully fetched and updated Claude Usage for account ${account.name}`
+                  )
+                }
+              } catch (error) {
+                logger.warn(
+                  `⚠️ Failed to fetch Claude Usage for account ${account.name}:`,
+                  error.message
+                )
+                // 继续使用 null
+              }
+            }
+          }
 
           // 判断授权类型：检查 scopes 是否包含 OAuth 相关权限
           const scopes = account.scopes && account.scopes.trim() ? account.scopes.split(' ') : []

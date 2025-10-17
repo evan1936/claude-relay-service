@@ -87,11 +87,19 @@ function formatAccountExpiry(account) {
   const subscriptionExpiresAt = normalizeNullableDate(rawSubscription)
   const tokenExpiresAt = normalizeNullableDate(rawToken)
 
+  // 规范化 Claude usage 相关的日期字段
+  const claudeFiveHourResetsAt = normalizeNullableDate(account.claudeFiveHourResetsAt)
+  const claudeSevenDayResetsAt = normalizeNullableDate(account.claudeSevenDayResetsAt)
+  const claudeSevenDayOpusResetsAt = normalizeNullableDate(account.claudeSevenDayOpusResetsAt)
+
   return {
     ...account,
     subscriptionExpiresAt,
     tokenExpiresAt,
-    expiresAt: subscriptionExpiresAt
+    expiresAt: subscriptionExpiresAt,
+    claudeFiveHourResetsAt,
+    claudeSevenDayResetsAt,
+    claudeSevenDayOpusResetsAt
   }
 }
 

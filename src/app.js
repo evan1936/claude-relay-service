@@ -14,7 +14,6 @@ const cacheMonitor = require('./utils/cacheMonitor')
 
 // Import routes
 const apiRoutes = require('./routes/api')
-const unifiedRoutes = require('./routes/unified')
 const adminRoutes = require('./routes/admin')
 const webRoutes = require('./routes/web')
 const apiStatsRoutes = require('./routes/apiStats')
@@ -55,11 +54,6 @@ class Application {
       // 💰 初始化价格服务
       logger.info('🔄 Initializing pricing service...')
       await pricingService.initialize()
-
-      // 📋 初始化模型服务
-      logger.info('🔄 Initializing model service...')
-      const modelService = require('./services/modelService')
-      await modelService.initialize()
 
       // 📊 初始化缓存监控
       await this.initializeCacheMonitoring()
@@ -257,7 +251,6 @@ class Application {
 
       // 🛣️ 路由
       this.app.use('/api', apiRoutes)
-      this.app.use('/api', unifiedRoutes) // 统一智能路由（支持 /v1/chat/completions 等）
       this.app.use('/claude', apiRoutes) // /claude 路由别名，与 /api 功能相同
       this.app.use('/admin', adminRoutes)
       this.app.use('/users', userRoutes)
@@ -269,8 +262,7 @@ class Application {
       this.app.use('/gemini', geminiRoutes) // 保留原有路径以保持向后兼容
       this.app.use('/openai/gemini', openaiGeminiRoutes)
       this.app.use('/openai/claude', openaiClaudeRoutes)
-      this.app.use('/openai', unifiedRoutes) // 复用统一智能路由，支持 /openai/v1/chat/completions
-      this.app.use('/openai', openaiRoutes) // Codex API 路由（/openai/responses, /openai/v1/responses）
+      this.app.use('/openai', openaiRoutes)
       // Droid 路由：支持多种 Factory.ai 端点
       this.app.use('/droid', droidRoutes) // Droid (Factory.ai) API 转发
       this.app.use('/azure', azureOpenaiRoutes)
@@ -565,6 +557,12 @@ class Application {
       `🚨 Rate limit cleanup service started (checking every ${cleanupIntervalMinutes} minutes)`
     )
 
+    // 📊 启动 Claude 使用额度监控服务
+    // 每5分钟更新所有账户的额度数据，并在5小时窗口快到期时主动重置
+    const claudeUsageMonitorService = require('./services/claudeUsageMonitorService')
+    claudeUsageMonitorService.start()
+    logger.info('📊 Claude usage monitor service started')
+    
     // 🔢 启动并发计数自动清理任务（Phase 1 修复：解决并发泄漏问题）
     // 每分钟主动清理所有过期的并发项，不依赖请求触发
     setInterval(async () => {
@@ -636,15 +634,6 @@ class Application {
             logger.info('💰 Pricing service cleaned up')
           } catch (error) {
             logger.error('❌ Error cleaning up pricing service:', error)
-          }
-
-          // 清理 model service 的文件监听器
-          try {
-            const modelService = require('./services/modelService')
-            modelService.cleanup()
-            logger.info('📋 Model service cleaned up')
-          } catch (error) {
-            logger.error('❌ Error cleaning up model service:', error)
           }
 
           // 停止限流清理服务
